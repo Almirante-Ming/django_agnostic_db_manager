@@ -1,0 +1,38 @@
+[project]
+name = "django-db-portability"
+version = "1.0.0"
+description = "SGBD-agnostic data extraction/import for Django, as two management commands (extract_database/import_database). No raw SQL, no pg_dump/mysqldump/COPY -- only Django's own ORM/serializers/migrations."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "V. Guilherme Barreto", email = "v.guilherme.barreto@gmail.com" },
+]
+requires-python = ">=3.12"
+# Django is the only runtime dependency -- see README.md "Dependencies".
+# No upper bound: the module only touches stable, long-lived Django APIs
+# (ORM, serializers, management commands, migrations loader/executor).
+dependencies = [
+    "django>=6.0",
+]
+classifiers = [
+    "Framework :: Django",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# This directory IS the importable package (it has to be, so that it works
+# as a Django app under the label `db_portability` when dropped into a
+# project), so the wheel has to re-nest the flat contents under a
+# `db_portability/` prefix -- otherwise `services.py`/`apps.py` install
+# flat into site-packages and `import db_portability` fails. After changing
+# this, build the wheel and list it: everything must sit under
+# `db_portability/`.
+[tool.hatch.build.targets.wheel]
+only-include = ["."]
+sources = { "." = "db_portability" }
+exclude = ["pyproject.toml", ".gitignore"]

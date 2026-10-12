@@ -1,0 +1,24 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test and coverage output
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Local databases produced by ad-hoc runs (the self-test suite uses an
+# in-memory database and a temporary BASE_DIR, so it leaves nothing here)
+*.sqlite3
