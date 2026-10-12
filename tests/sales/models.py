@@ -4,7 +4,7 @@ multi-table-inheritance subclass of the shared person model.
 
 from django.db import models
 
-from db_portability.selftests.people.models import Person
+from db_portability.tests.people.models import Person
 
 
 class SalesPerson(Person):

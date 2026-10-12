@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Run this app's own test suite, standalone.
 
-    python db_portability/selftests/runtests.py            # everything
-    python db_portability/selftests/runtests.py suite_services   # one module
+    python db_portability/tests/runtests.py            # everything
+    python db_portability/tests/runtests.py test_services   # one module
 
 No host project, settings module or manage.py required -- the suite brings
 its own settings and fixture models. The suite files are named
@@ -24,7 +24,7 @@ def main(argv):
     app_dir = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(app_dir.parent))
 
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'db_portability.selftests.settings')
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'db_portability.tests.settings')
 
     import django
     from django.test.utils import get_runner
@@ -32,9 +32,9 @@ def main(argv):
 
     django.setup()
 
-    requested = argv[1:] or ['suite_services', 'suite_commands']
+    requested = argv[1:] or ['test_services', 'test_commands']
     labels = [
-        name if name.startswith('db_portability.') else f'db_portability.selftests.{name}'
+        name if name.startswith('db_portability.') else f'db_portability.tests.{name}'
         for name in requested
     ]
 

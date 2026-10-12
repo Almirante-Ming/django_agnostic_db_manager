@@ -23,8 +23,12 @@ class Command(BaseCommand):
             help='Local output directory (default: BASE_DIR/db_extracts).',
         )
         parser.add_argument(
-            '--skip-upload', action='store_true', default=False,
-            help='Do not run the configured upload callback; write locally only.',
+            '--upload', action='store_true', default=False,
+            help=(
+                'Also send the package through the configured upload callback '
+                '(DB_PORTABILITY_UPLOAD_CALLBACK). Off by default: an extraction '
+                'writes locally and sends nothing anywhere unless asked.'
+            ),
         )
         parser.add_argument(
             '--upload-folder-id', default=None,
@@ -55,15 +59,17 @@ class Command(BaseCommand):
         for key, count in manifest['counts'].items():
             self.stdout.write(f'  {key}: {count}')
 
-        if not options.get('skip_upload'):
-            result = svc.upload_bundle_with_fallback(
-                archive_path, folder_id=options.get('upload_folder_id'),
-            )
-            if result['status'] == 'uploaded':
-                link = result.get('web_view_link') or result.get('file_id')
-                self.stdout.write(self.style.SUCCESS(f'Uploaded: {link}'))
-            else:
-                self.stdout.write(self.style.WARNING(
-                    f"Upload did not happen ({result.get('error')}); "
-                    f"kept locally only, at {archive_path}"
-                ))
+        if not options.get('upload'):
+            return
+
+        result = svc.upload_bundle_with_fallback(
+            archive_path, folder_id=options.get('upload_folder_id'),
+        )
+        if result['status'] == 'uploaded':
+            link = result.get('web_view_link') or result.get('file_id')
+            self.stdout.write(self.style.SUCCESS(f'Uploaded: {link}'))
+        else:
+            self.stdout.write(self.style.WARNING(
+                f"Upload did not happen ({result.get('error')}); "
+                f"kept locally only, at {archive_path}"
+            ))

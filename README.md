@@ -62,8 +62,10 @@ manage.py extract_database
 # Only one department/tenant (needs the settings below)
 manage.py extract_database --department sales
 
-# Write locally only, skipping the optional upload callback
-manage.py extract_database --skip-upload
+# Also send the package through the configured upload callback.
+# Off by default: an extraction writes locally and sends nothing anywhere
+# unless this flag is passed.
+manage.py extract_database --upload
 
 # Import into whatever database this process points at -- which may be a
 # different engine than the one the package came from. Pending migrations
@@ -75,11 +77,38 @@ manage.py import_database --input /path/to/db-extract-<timestamp>.tar.gz
 manage.py import_database --input <package> --dry-run
 ```
 
+### Flags
+
+`extract_database`:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--department <label>` | none (full) | Limit the package to one department. Only accepts values from `DB_PORTABILITY_DEPARTMENTS`. |
+| `--output-dir <path>` | `BASE_DIR/db_extracts` | Where the `.tar.gz` is written. |
+| `--upload` | off | Also run the configured upload callback. Off means nothing leaves the machine. |
+| `--upload-folder-id <id>` | none | Passed through to the callback as `folder_id` for this run. |
+
+`import_database`:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--input <path>` | required | The `.tar.gz`, or an already-extracted directory. |
+| `--dry-run` | off | Validate, check compatibility and conflicts, report, write nothing. |
+
+There is deliberately **no** `--department` on import: the scope is
+whatever the package contains, read from its manifest.
+
 A package is a `.tar.gz` holding `manifest.json` plus one
 `data/<app>.json` per included app. The local copy under
 `BASE_DIR/db_extracts/` is always written first and never deleted — it is
 the fallback, not a conditional extra — so a failing upload can never cost
 you an extraction.
+
+**Extraction never sends your data anywhere unless you ask.** Uploading is
+opt-in per run via `--upload`; configuring
+`DB_PORTABILITY_UPLOAD_CALLBACK` makes the option *available*, not
+automatic. A database export is exactly the payload you do not want
+leaving a machine as a side effect of a default.
 
 ### Scopes
 
@@ -121,7 +150,7 @@ per-department scope.
 | `DB_PORTABILITY_SHARED_APP` | `str` | `None` | App label holding records shared across departments. Its filtered file is included alongside the department's own app on a scoped extraction. |
 | `DB_PORTABILITY_PERSON_MODEL` | `str` — a model label like `"people.Person"` | `None` | The shared "person" model each department app subclasses through multi-table inheritance. Used to work out, by introspection, which shared-app rows belong to a department. |
 | `DB_PORTABILITY_DEPARTMENT_SCOPED_MODELS` | `dict[str, str]` — `{"app.Model": "field_name"}` | `{}` | Shared-app models scoped to a department by a plain field value rather than a foreign key to the person model — the one case introspection cannot infer. Anything reachable through a FK/O2O to the person model is discovered automatically and needs no entry. |
-| `DB_PORTABILITY_UPLOAD_CALLBACK` | `str` — dotted path to a callable | `None` | Optional upload step after a package is written. Signature: `callback(path: str, folder_id=None) -> dict`. Unset, no upload is attempted. |
+| `DB_PORTABILITY_UPLOAD_CALLBACK` | `str` — dotted path to a callable | `None` | Makes `--upload` available. Signature: `callback(path: str, folder_id=None) -> dict`. Configuring it does not cause uploads on its own — they stay opt-in per run. |
 | `DB_PORTABILITY_ARCHIVE_PREFIX` | `str` | `"db-extract"` | Filename prefix for generated packages. Import accepts any filename, so changing this never invalidates existing packages. |
 
 See `.env.example` for a worked example of each.
@@ -145,20 +174,50 @@ makes a per-department package safe to hand over on its own.
 
 ## Tests
 
-The app carries its own suite, in `selftests/`. It is self-contained —
-its own settings, its own SQLite-in-memory database, and its own fixture
-apps (`people` shared, `sales`/`support` as departments, `plain` as a
-misconfigured one) — so it needs no host project and asserts nothing
-about yours:
+The app carries its own suite in `tests/`, in the normal Django layout —
+so **a plain `manage.py test` collects and runs it** alongside your own
+tests. It is self-contained: its own fixture apps (`people` shared,
+`sales`/`support` as departments, `plain` as a misconfigured one) and its
+own pinned `DB_PORTABILITY_*` values, so it asserts nothing about your
+models or your configuration.
 
-```bash
-python db_portability/selftests/runtests.py                 # all of it
-python db_portability/selftests/runtests.py suite_services  # one module
+For it to actually run inside your project, add the fixture apps while
+testing — ideally only then, so their tables never reach a real database:
+
+```python
+if TESTING:  # however your project detects a test run
+    INSTALLED_APPS += [
+        'db_portability.tests.people',
+        'db_portability.tests.sales',
+        'db_portability.tests.support',
+        'db_portability.tests.plain',
+    ]
 ```
 
-It runs from a bare copy of this directory anywhere on disk; the only
-requirement is that the parent of `db_portability/` is importable, which
-`runtests.py` arranges itself.
+```bash
+manage.py test db_portability   # just this app
+manage.py test                  # alongside everything else
+```
+
+Without those apps the suite is still collected, but skips itself with a
+message naming what is missing — it never fails a project that has not
+opted in.
+
+From this package's own repository, where this directory is the root and
+there is no host project at all:
+
+```bash
+uv sync --no-install-project --group dev
+.venv/bin/python tests/runtests.py                # all of it
+.venv/bin/python tests/runtests.py test_services  # one module
+```
+
+`--no-install-project` is required rather than preferred — see the
+comment above `[dependency-groups]` in `pyproject.toml` for why an
+editable install cannot work with this layout. The package does not need
+installing anyway: `runtests.py` puts it on `sys.path` itself, which is
+also why the suite runs from a bare copy of this directory anywhere on
+disk.
 
 Because the suite runs against fixture models the app was never written
 for, a green run is also the portability check: it proves the discovery
@@ -183,16 +242,20 @@ What it pins, in the order a future change is most likely to break it:
   the conflict check, since it is the more fundamental mismatch).
 - **Compatibility of old packages** — a package carrying no migration
   state still imports.
-- **CLI contract** — flag names, the upload callback receiving the folder
-  id, `--skip-upload` not touching the callback, a failed upload still
-  leaving the local archive, and `--dry-run` writing nothing.
+- **CLI contract** — flag names, uploading staying opt-in (a default run
+  calls no callback even when one is configured), the callback receiving
+  the folder id, a failed upload still leaving the local archive, and
+  `--dry-run` writing nothing.
 
-The suite files are named `suite_*.py` rather than `test_*.py` on
-purpose: a host project running `manage.py test` must not collect them,
-since they need the fixture apps in `INSTALLED_APPS`. If you want
-coverage of *your* project's wiring — your real models against these
-settings — write that as a normal test in your project; it complements
-this suite rather than duplicating it.
+One case, the full-database round trip, skips inside a host project:
+restoring a full package means first emptying the whole database, and a
+test must not delete rows it does not own. It runs under
+`tests/runtests.py`, where the only data present is the suite's own. The
+per-department round trips touch fixture rows only and run everywhere.
+
+If you want coverage of *your* project's wiring — your real models
+against your own `DB_PORTABILITY_*` values — write that as a normal test
+in your project; it complements this suite rather than duplicating it.
 
 ## License
 

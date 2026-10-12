@@ -1,7 +1,8 @@
 """Service-layer regression suite for db_portability.services.
 
-Run with `python db_portability/selftests/runtests.py` (see runtests.py for
-why these files are not named test_*.py).
+Collected by a plain `manage.py test` in any project that installed
+this app's fixture apps, and runnable with no host project at all via
+`python db_portability/tests/runtests.py`. See base.py for both.
 
 What this suite is for: the app discovers the host project's shape by
 introspection and reads the rest from settings, so the things most likely
@@ -18,24 +19,30 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-from django.test import TestCase, override_settings
+from django.test import override_settings
 
 from db_portability import services as svc
-from db_portability.selftests.people.models import (
+from db_portability.tests.base import PortabilityTestCase, require_fixture_apps
+
+# Importing the fixture models requires their apps to be installed, so the
+# skip check has to run first -- hence the imports below the call.
+require_fixture_apps()
+
+from db_portability.tests.people.models import (  # noqa: E402
     Account, Announcement, BrandingConfig, Person,
 )
-from db_portability.selftests.plain.models import PlainRecord
-from db_portability.selftests.sales.models import SalesNote, SalesPerson
-from db_portability.selftests.support.models import SupportPerson, SupportTicket
+from db_portability.tests.plain.models import PlainRecord  # noqa: E402
+from db_portability.tests.sales.models import SalesNote, SalesPerson  # noqa: E402
+from db_portability.tests.support.models import SupportPerson, SupportTicket  # noqa: E402
 
 
 def _tempdir(test):
-    path = Path(tempfile.mkdtemp(prefix='db-portability-selftest-case-'))
+    path = Path(tempfile.mkdtemp(prefix='db-portability-test-'))
     test.addCleanup(shutil.rmtree, path, ignore_errors=True)
     return path
 
 
-class SettingsReadingTests(TestCase):
+class SettingsReadingTests(PortabilityTestCase):
     """Every knob is optional and read at call time, never cached at import."""
 
     def test_valid_departments_reads_settings(self):
@@ -64,7 +71,7 @@ class SettingsReadingTests(TestCase):
         self.assertEqual(svc.archive_prefix(), 'acme-backup')
 
 
-class ResolveIncludedAppsTests(TestCase):
+class ResolveIncludedAppsTests(PortabilityTestCase):
 
     def test_full_scope_includes_apps_with_models(self):
         included = svc.resolve_included_apps()
@@ -92,7 +99,7 @@ class ResolveIncludedAppsTests(TestCase):
             svc.resolve_included_apps(department='marketing')
 
 
-class PersonModelDiscoveryTests(TestCase):
+class PersonModelDiscoveryTests(PortabilityTestCase):
     """The MTI subclass and the fields pointing at it are found by
     introspection; no naming convention, no hand-maintained map.
     """
@@ -123,7 +130,7 @@ class PersonModelDiscoveryTests(TestCase):
         self.assertNotIn(PlainRecord, found_models)
 
 
-class DepartmentClosureTests(TestCase):
+class DepartmentClosureTests(PortabilityTestCase):
 
     def setUp(self):
         self.sales_person = SalesPerson.objects.create(name='Dana', quota=10)
@@ -184,7 +191,7 @@ class DepartmentClosureTests(TestCase):
         self.assertIn(Person, querysets)
 
 
-class ManifestTests(TestCase):
+class ManifestTests(PortabilityTestCase):
 
     def test_records_format_version_scope_apps_and_counts(self):
         manifest = svc.build_manifest({'type': 'full'}, ['people'], {'people.Person': 2})
@@ -207,7 +214,7 @@ class ManifestTests(TestCase):
         self.assertEqual(manifest['migrations'], {'auth': ['0012_alter_user_first_name_max_length']})
 
 
-class MigrationStateTests(TestCase):
+class MigrationStateTests(PortabilityTestCase):
     """The schema-version stamp an import checks compatibility against."""
 
     def test_records_applied_leaves_for_apps_that_have_migrations(self):
@@ -249,7 +256,7 @@ class MigrationStateTests(TestCase):
         self.assertEqual(unknown, ['app_that_does_not_exist.0001_initial'])
 
 
-class DumpAppsToBundleTests(TestCase):
+class DumpAppsToBundleTests(PortabilityTestCase):
 
     def setUp(self):
         self.sales_person = SalesPerson.objects.create(name='Dana')
@@ -295,7 +302,7 @@ class DumpAppsToBundleTests(TestCase):
         self.assertEqual(list((work_dir / 'data').glob('*.json')), [])
 
 
-class BundleArchiveTests(TestCase):
+class BundleArchiveTests(PortabilityTestCase):
 
     def setUp(self):
         SalesPerson.objects.create(name='Dana')
@@ -328,7 +335,7 @@ class BundleArchiveTests(TestCase):
         self.assertEqual(manifest['scope']['department'], 'sales')
 
 
-class ExtractBundleToWorkdirTests(TestCase):
+class ExtractBundleToWorkdirTests(PortabilityTestCase):
 
     def test_accepts_an_already_extracted_directory(self):
         work_dir = _tempdir(self)
@@ -341,7 +348,7 @@ class ExtractBundleToWorkdirTests(TestCase):
             svc.extract_bundle_to_workdir(broken)
 
 
-class ValidateBundleTests(TestCase):
+class ValidateBundleTests(PortabilityTestCase):
 
     def test_missing_manifest_is_refused(self):
         with self.assertRaises(ValueError):
@@ -378,7 +385,7 @@ class ValidateBundleTests(TestCase):
             svc.validate_bundle(work_dir)
 
 
-class DestinationConflictTests(TestCase):
+class DestinationConflictTests(PortabilityTestCase):
 
     def setUp(self):
         self.sales_person = SalesPerson.objects.create(name='Dana')
@@ -407,7 +414,7 @@ class DestinationConflictTests(TestCase):
         self.assertNotIn(str(self.sales_person.pk), conflicting)
 
 
-class EnsureMigrationsAppliedTests(TestCase):
+class EnsureMigrationsAppliedTests(PortabilityTestCase):
 
     def test_is_a_noop_when_nothing_is_pending(self):
         with mock.patch('db_portability.services.call_command') as mocked:
@@ -434,7 +441,7 @@ def _failing_upload(path, folder_id=None):
     raise RuntimeError('upstream exploded')
 
 
-class UploadCallbackTests(TestCase):
+class UploadCallbackTests(PortabilityTestCase):
     """The upload hook must stay optional and never cost an extraction."""
 
     def setUp(self):
@@ -448,7 +455,7 @@ class UploadCallbackTests(TestCase):
         self.assertEqual(result['local_path'], str(self.bundle))
 
     @override_settings(
-        DB_PORTABILITY_UPLOAD_CALLBACK='db_portability.selftests.suite_services._fake_upload',
+        DB_PORTABILITY_UPLOAD_CALLBACK='db_portability.tests.test_services._fake_upload',
     )
     def test_configured_callback_is_resolved_and_called(self):
         result = svc.upload_bundle_with_fallback(self.bundle, folder_id='folder-9')
@@ -458,7 +465,7 @@ class UploadCallbackTests(TestCase):
         self.assertEqual(_fake_upload.calls, [(str(self.bundle), 'folder-9')])
 
     @override_settings(
-        DB_PORTABILITY_UPLOAD_CALLBACK='db_portability.selftests.suite_services._failing_upload',
+        DB_PORTABILITY_UPLOAD_CALLBACK='db_portability.tests.test_services._failing_upload',
     )
     def test_a_raising_callback_falls_back_to_local(self):
         with self.assertLogs('db_portability.services', level='WARNING'):
@@ -468,7 +475,7 @@ class UploadCallbackTests(TestCase):
         self.assertTrue(self.bundle.exists(), 'the local copy must survive a failed upload')
 
 
-class LoadBundleTests(TestCase):
+class LoadBundleTests(PortabilityTestCase):
 
     def test_reinstates_rows_and_their_references(self):
         person = SalesPerson.objects.create(name='Dana', quota=7)
@@ -493,7 +500,7 @@ class LoadBundleTests(TestCase):
         self.assertEqual(Account.objects.get(person_id=person.pk).username, 'dana')
 
 
-class ImportLogTests(TestCase):
+class ImportLogTests(PortabilityTestCase):
 
     def test_writes_a_log_naming_the_outcome_and_the_conflicts(self):
         from datetime import datetime, timezone

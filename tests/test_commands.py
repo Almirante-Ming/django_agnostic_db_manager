@@ -1,7 +1,8 @@
 """Command-level regression suite for extract_database / import_database.
 
-Run with `python db_portability/selftests/runtests.py` (see runtests.py for
-why these files are not named test_*.py).
+Collected by a plain `manage.py test` in any project that installed
+this app's fixture apps, and runnable with no host project at all via
+`python db_portability/tests/runtests.py`. See base.py for both.
 
 This suite pins the CLI contract -- flag names, exit behavior, and what
 each refusal protects -- plus the round trips end to end. The round trips
@@ -20,16 +21,24 @@ from pathlib import Path
 from unittest import mock
 
 from django.core.management import CommandError, call_command
-from django.test import TestCase, override_settings
+from django.test import override_settings
 
 from db_portability import services as svc
-from db_portability.selftests.people.models import Account, BrandingConfig, Person
-from db_portability.selftests.sales.models import SalesNote, SalesPerson
-from db_portability.selftests.support.models import SupportPerson
+from db_portability.tests.base import (
+    PortabilityTestCase, host_apps_outside_fixtures, require_fixture_apps,
+)
+
+# Importing the fixture models requires their apps to be installed, so the
+# skip check has to run first -- hence the imports below the call.
+require_fixture_apps()
+
+from db_portability.tests.people.models import Account, BrandingConfig, Person  # noqa: E402
+from db_portability.tests.sales.models import SalesNote, SalesPerson  # noqa: E402
+from db_portability.tests.support.models import SupportPerson  # noqa: E402
 
 
 def _tempdir(test):
-    path = Path(tempfile.mkdtemp(prefix='db-portability-selftest-cmd-'))
+    path = Path(tempfile.mkdtemp(prefix='db-portability-test-'))
     test.addCleanup(shutil.rmtree, path, ignore_errors=True)
     return path
 
@@ -38,6 +47,15 @@ def _run(*args, **kwargs):
     out = StringIO()
     call_command(*args, stdout=out, **kwargs)
     return out.getvalue()
+
+
+def _tracking_upload(path, folder_id=None):
+    """Module-level so it can be referenced by dotted path from settings."""
+    _tracking_upload.calls.append((path, folder_id))
+    return {'file_id': 'x'}
+
+
+_tracking_upload.calls = []
 
 
 def _rewrite_manifest(archive, mutate, into):
@@ -57,14 +75,14 @@ def _rewrite_manifest(archive, mutate, into):
     return forged
 
 
-class ExtractCommandTests(TestCase):
+class ExtractCommandTests(PortabilityTestCase):
 
     def setUp(self):
         self.sales_person = SalesPerson.objects.create(name='Dana')
 
     def test_full_extraction_writes_one_archive_and_reports_the_scope(self):
         out_dir = _tempdir(self)
-        output = _run('extract_database', '--skip-upload', f'--output-dir={out_dir}')
+        output = _run('extract_database', f'--output-dir={out_dir}')
         archives = list(out_dir.glob('*.tar.gz'))
         self.assertEqual(len(archives), 1)
         self.assertIn('full', output)
@@ -72,21 +90,21 @@ class ExtractCommandTests(TestCase):
     def test_department_extraction_reports_the_department(self):
         out_dir = _tempdir(self)
         output = _run(
-            'extract_database', '--department=sales', '--skip-upload', f'--output-dir={out_dir}',
+            'extract_database', '--department=sales', f'--output-dir={out_dir}',
         )
         self.assertEqual(len(list(out_dir.glob('*.tar.gz'))), 1)
         self.assertIn('sales', output)
 
     def test_counts_are_printed_for_the_operator(self):
         out_dir = _tempdir(self)
-        output = _run('extract_database', '--skip-upload', f'--output-dir={out_dir}')
+        output = _run('extract_database', f'--output-dir={out_dir}')
         self.assertIn('people.Person', output)
 
     def test_unknown_department_is_rejected_by_the_parser(self):
         out_dir = _tempdir(self)
         with self.assertRaises(CommandError):
             call_command(
-                'extract_database', '--department=marketing', '--skip-upload',
+                'extract_database', '--department=marketing',
                 f'--output-dir={out_dir}', stdout=StringIO(),
             )
         self.assertEqual(list(out_dir.glob('*.tar.gz')), [])
@@ -95,7 +113,7 @@ class ExtractCommandTests(TestCase):
         out_dir = _tempdir(self)
         with self.assertRaises(CommandError):
             call_command(
-                'extract_database', '--department=plain', '--skip-upload',
+                'extract_database', '--department=plain',
                 f'--output-dir={out_dir}', stdout=StringIO(),
             )
         self.assertEqual(list(out_dir.glob('*.tar.gz')), [])
@@ -103,44 +121,63 @@ class ExtractCommandTests(TestCase):
     def test_archive_prefix_setting_names_the_file(self):
         out_dir = _tempdir(self)
         with override_settings(DB_PORTABILITY_ARCHIVE_PREFIX='acme-backup'):
-            _run('extract_database', '--skip-upload', f'--output-dir={out_dir}')
+            _run('extract_database', f'--output-dir={out_dir}')
         self.assertTrue(list(out_dir.glob('acme-backup-*.tar.gz')))
 
 
-class ExtractCommandUploadTests(TestCase):
+class ExtractCommandUploadTests(PortabilityTestCase):
+    """Uploading is opt-in: extracting must never send data anywhere
+    unless the operator explicitly asked for it on that run.
+    """
 
     def setUp(self):
         SalesPerson.objects.create(name='Dana')
         self.out_dir = _tempdir(self)
 
-    def test_skip_upload_never_touches_the_callback(self):
-        with mock.patch('db_portability.services.upload_bundle_with_fallback') as mocked:
-            _run('extract_database', '--skip-upload', f'--output-dir={self.out_dir}')
+    def test_default_run_does_not_upload(self):
+        with mock.patch(
+            'db_portability.management.commands.extract_database.svc.upload_bundle_with_fallback',
+        ) as mocked:
+            _run('extract_database', f'--output-dir={self.out_dir}')
         mocked.assert_not_called()
+        self.assertEqual(len(list(self.out_dir.glob('*.tar.gz'))), 1)
 
-    def test_without_skip_the_callback_runs_and_receives_the_folder(self):
+    def test_default_run_does_not_upload_even_with_a_callback_configured(self):
+        with override_settings(
+            DB_PORTABILITY_UPLOAD_CALLBACK='db_portability.tests.test_commands._tracking_upload',
+        ):
+            _tracking_upload.calls = []
+            _run('extract_database', f'--output-dir={self.out_dir}')
+        self.assertEqual(_tracking_upload.calls, [])
+
+    def test_upload_flag_runs_the_callback_and_passes_the_folder(self):
         with mock.patch(
             'db_portability.management.commands.extract_database.svc.upload_bundle_with_fallback',
             return_value={'status': 'uploaded', 'web_view_link': 'https://example.invalid/x'},
         ) as mocked:
             output = _run(
-                'extract_database', f'--output-dir={self.out_dir}',
+                'extract_database', '--upload', f'--output-dir={self.out_dir}',
                 '--upload-folder-id=folder-9',
             )
         self.assertEqual(mocked.call_args.kwargs['folder_id'], 'folder-9')
         self.assertIn('https://example.invalid/x', output)
+
+    def test_upload_flag_without_a_callback_configured_just_warns(self):
+        output = _run('extract_database', '--upload', f'--output-dir={self.out_dir}')
+        self.assertIn('not configured', output)
+        self.assertEqual(len(list(self.out_dir.glob('*.tar.gz'))), 1)
 
     def test_a_failed_upload_still_leaves_the_local_archive_and_warns(self):
         with mock.patch(
             'db_portability.management.commands.extract_database.svc.upload_bundle_with_fallback',
             return_value={'status': 'local_fallback', 'error': 'no credentials'},
         ):
-            output = _run('extract_database', f'--output-dir={self.out_dir}')
+            output = _run('extract_database', '--upload', f'--output-dir={self.out_dir}')
         self.assertIn('no credentials', output)
         self.assertEqual(len(list(self.out_dir.glob('*.tar.gz'))), 1)
 
 
-class ImportCommandTests(TestCase):
+class ImportCommandTests(PortabilityTestCase):
 
     def setUp(self):
         self.sales_person = SalesPerson.objects.create(name='Dana', quota=4)
@@ -150,7 +187,7 @@ class ImportCommandTests(TestCase):
 
     def _extract(self, department=None, output_dir=None):
         out_dir = output_dir or self.out_dir
-        args = ['extract_database', '--skip-upload', f'--output-dir={out_dir}']
+        args = ['extract_database', f'--output-dir={out_dir}']
         if department:
             args.append(f'--department={department}')
         call_command(*args, stdout=StringIO())
@@ -178,6 +215,18 @@ class ImportCommandTests(TestCase):
         BrandingConfig.objects.filter(department='support').delete()
 
     def test_full_round_trip_restores_everything(self):
+        # A full package covers the whole database, so restoring it means
+        # first emptying the whole database. Inside a host project that
+        # would mean deleting rows this suite does not own, so this one
+        # case only runs standalone. The per-department round trips below
+        # touch fixture rows only and run everywhere.
+        outside = host_apps_outside_fixtures()
+        if outside:
+            self.skipTest(
+                'a full round trip would have to delete data this suite does not own '
+                f'(apps: {", ".join(sorted(outside))}) -- run tests/runtests.py for this case'
+            )
+
         archive = self._extract()
         self._drop_sales()
         self._drop_support()
@@ -255,7 +304,7 @@ class ImportCommandTests(TestCase):
         self.assertTrue(SalesPerson.objects.filter(pk=self.sales_person.pk).exists())
 
 
-class ImportCommandMigrationCompatibilityTests(TestCase):
+class ImportCommandMigrationCompatibilityTests(PortabilityTestCase):
     """The schema-version guard: a package stamped with migrations this
     code does not have must be refused before anything is written.
     """
@@ -264,7 +313,7 @@ class ImportCommandMigrationCompatibilityTests(TestCase):
         self.sales_person = SalesPerson.objects.create(name='Dana')
         self.out_dir = _tempdir(self)
         call_command(
-            'extract_database', '--department=sales', '--skip-upload',
+            'extract_database', '--department=sales',
             f'--output-dir={self.out_dir}', stdout=StringIO(),
         )
         self.archive = next(self.out_dir.glob('*.tar.gz'))

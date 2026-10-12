@@ -4,7 +4,7 @@ asserted rather than assumed.
 
 from django.db import models
 
-from db_portability.selftests.people.models import Person
+from db_portability.tests.people.models import Person
 
 
 class SupportPerson(Person):

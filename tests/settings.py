@@ -10,9 +10,9 @@ against, which is the whole point of it being a portable app.
 import tempfile
 from pathlib import Path
 
-BASE_DIR = Path(tempfile.mkdtemp(prefix='db-portability-selftest-'))
+BASE_DIR = Path(tempfile.mkdtemp(prefix='db-portability-test-'))
 
-SECRET_KEY = 'selftests-only-not-a-secret'
+SECRET_KEY = 'tests-only-not-a-secret'
 DEBUG = True
 USE_TZ = True
 
@@ -27,10 +27,10 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.auth',
     'db_portability',
-    'db_portability.selftests.people',
-    'db_portability.selftests.sales',
-    'db_portability.selftests.support',
-    'db_portability.selftests.plain',
+    'db_portability.tests.people',
+    'db_portability.tests.sales',
+    'db_portability.tests.support',
+    'db_portability.tests.plain',
 ]
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

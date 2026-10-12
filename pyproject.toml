@@ -5,7 +5,7 @@ description = "SGBD-agnostic data extraction/import for Django, as two managemen
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "V. Guilherme Barreto", email = "v.guilherme.barreto@gmail.com" },
+    { name = "V. Guilherme", email = "v.guilherme.barreto@gmail.com" },
 ]
 requires-python = ">=3.12"
 # Django is the only runtime dependency -- see README.md "Dependencies".
@@ -19,6 +19,30 @@ classifiers = [
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Intended Audience :: Developers",
+]
+
+# Everything needed to develop and test this package on its own, with no
+# host project around it:
+#
+#     uv sync --no-install-project --group dev
+#     .venv/bin/python tests/runtests.py
+#
+# The suite needs nothing beyond Django itself -- it brings its own
+# settings, an in-memory SQLite database and its own fixture apps -- so
+# this group exists to pin that, not to add test machinery. In a host
+# project the same tests are picked up by a plain `manage.py test`; see
+# tests/base.py.
+#
+# `--no-install-project` is required, not a preference: this project's
+# root IS the importable package (so that the directory works as a Django
+# app when dropped into a project), which needs the `sources` rewrite
+# below, and hatchling cannot build an EDITABLE wheel when a rewrite adds
+# a prefix rather than removing one. A normal `uv sync` therefore fails.
+# Nothing is lost -- the suite puts the package on sys.path itself, so it
+# never needed to be installed -- and `uv build` is unaffected.
+[dependency-groups]
+dev = [
+    "django>=6.0",
 ]
 
 [build-system]
