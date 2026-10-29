@@ -127,10 +127,27 @@ that department. Importing one department does not require, or disturb,
 the others already present in the destination — the conflict check is per
 individual primary key, not per table.
 
+### Extracting from a database behind the code
+
+The extraction reads the source database as it is, not as the models
+declare it: tables and columns come from Django's introspection API
+(`SourceSchema`). A model whose table the database does not have is
+skipped, a field whose column it does not have is left out, and both are
+listed in `manifest["schema_gaps"]`. `manifest["pending_migrations"]`
+lists the migrations the extracting code knows but the database has not
+applied. A snapshot can be rebuilt by migrating an empty database to
+`manifest["migrations"]` and loading the package there.
+
+Limitation: a related model's `natural_key()` still loads that model in
+full, so a model *with* a natural key that gained a column the database
+lacks still fails the extraction.
+
 ### Compatibility check on import
 
-Each manifest records the leaf migrations applied per included app at
-extraction time (`manifest["migrations"]`). On import, that is compared
+Each manifest records the latest migrations applied per included app at
+extraction time (`manifest["migrations"]`) -- the applied frontier, so a
+database whose leaf migrations are not applied yet is still stamped with
+the schema it really has. On import, that is compared
 against the migrations the **destination's current code** knows about —
 not merely what is applied there — and the import aborts before writing
 anything if the package names a migration this codebase does not

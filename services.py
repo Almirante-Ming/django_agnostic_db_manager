@@ -27,14 +27,13 @@ import logging
 import tarfile
 import tempfile
 from datetime import datetime, timezone
-from itertools import chain
 from pathlib import Path
 
 from django.apps import apps
 from django.conf import settings
 from django.core import serializers
 from django.core.management import call_command
-from django.db import connection, transaction
+from django.db import connection, router, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.loader import MigrationLoader
 from django.utils.module_loading import import_string
@@ -145,7 +144,12 @@ def _person_referencing_fields(person_model):
     return pairs
 
 
-def resolve_department_closure(department):
+def _has_column(model, field_name, schema):
+    plan = dumpable_fields(model, schema)
+    return plan is not None and field_name in plan[0]
+
+
+def resolve_department_closure(department, schema=None):
     """Querysets over the shared app holding exactly the rows that belong
     to one department (referential closure). A shared-app row belongs to a
     department when it is:
@@ -163,6 +167,10 @@ def resolve_department_closure(department):
     Return order matters for load order within the resulting file (a
     person row must precede whatever references it) and follows the order
     of the steps above.
+
+    With `schema` (a SourceSchema), references the source database does
+    not have yet -- a referencing model without its table, or a FK
+    without its column -- are left out instead of failing the query.
     """
     if department not in valid_departments():
         raise ValueError(f"Invalid department: {department!r}")
@@ -183,33 +191,112 @@ def resolve_department_closure(department):
         for model, field_name in _person_referencing_fields(person_model):
             if shared_app and model._meta.app_label != shared_app:
                 continue
+            if schema is not None and not _has_column(model, field_name, schema):
+                continue
             querysets.append(model._default_manager.filter(**{f'{field_name}_id__in': person_ids}))
 
     scoped_models = getattr(settings, 'DB_PORTABILITY_DEPARTMENT_SCOPED_MODELS', None) or {}
     for model_label, field_name in scoped_models.items():
         model = apps.get_model(model_label)
+        if schema is not None and not _has_column(model, field_name, schema):
+            continue
         querysets.append(model._default_manager.filter(**{field_name: department}))
 
     return querysets
 
 
+class SourceSchema:
+    """Tables and columns the source database really has, read through
+    Django's engine-agnostic introspection API. The extraction follows
+    this, not the models: the code running the extraction may be ahead of
+    the database (migrations not applied there yet) and must still be able
+    to copy whatever the database holds.
+    """
+
+    def __init__(self):
+        with connection.cursor() as cursor:
+            self._tables = set(connection.introspection.table_names(cursor))
+        self._columns = {}
+
+    def has_table(self, table):
+        return table in self._tables
+
+    def columns(self, table):
+        if table not in self._columns:
+            with connection.cursor() as cursor:
+                description = connection.introspection.get_table_description(cursor, table)
+            self._columns[table] = {col.name for col in description}
+        return self._columns[table]
+
+
+def dumpable_fields(model, schema):
+    """Plan how to read `model` from the source database as it is.
+
+    Returns None when the model's table (or one of its multi-table
+    inheritance parents' tables) does not exist there. Otherwise returns
+    (fields, missing): `fields` are the local field names present in the
+    database -- what gets selected and serialized -- and `missing` the ones
+    the model declares but the database lacks.
+    """
+    for table_model in [model, *model._meta.get_parent_list()]:
+        if not schema.has_table(table_model._meta.db_table):
+            return None
+    columns = schema.columns(model._meta.db_table)
+    if model._meta.pk.column not in columns:
+        return None
+
+    fields, missing = [], []
+    for field in model._meta.local_fields:
+        if field.primary_key:
+            continue  # always selected and serialized as 'pk'
+        (fields if field.column in columns else missing).append(field.name)
+    for field in model._meta.local_many_to_many:
+        through_table = field.remote_field.through._meta.db_table
+        (fields if schema.has_table(through_table) else missing).append(field.name)
+    return fields, missing
+
+
 def capture_migration_state(included_apps):
-    """Leaf migrations already applied in the source database, per included
-    app, at extraction time. Recorded in the manifest so an import can tell
-    whether the package came from a schema the destination's code does not
-    know -- a real compatibility signal, unlike the static
-    BUNDLE_FORMAT_VERSION on its own.
+    """Latest migrations applied in the source database, per included app,
+    at extraction time: the applied frontier, i.e. the applied migrations
+    no other applied migration of the same app builds on. That names the
+    schema the data was read from even when the database is behind the
+    code running the extraction (its leaves not applied yet), and an
+    applied migration the code does not know at all is recorded as is.
+    Recorded in the manifest so an import can tell whether the package
+    came from a schema the destination's code does not know, and so a
+    snapshot can be rebuilt by migrating an empty database to this state.
     """
     loader = MigrationLoader(connection, ignore_no_migrations=True)
+    applied = set(loader.applied_migrations)
     state = {}
     for app_label in included_apps:
-        leaves = sorted(
-            name for (app_name, name) in loader.graph.leaf_nodes()
-            if app_name == app_label and (app_name, name) in loader.applied_migrations
-        )
-        if leaves:
-            state[app_label] = leaves
+        frontier = []
+        for app_name, name in applied:
+            if app_name != app_label:
+                continue
+            node = loader.graph.node_map.get((app_name, name))
+            if node is not None and any(
+                child.key in applied for child in node.children if child.key[0] == app_label
+            ):
+                continue
+            frontier.append(name)
+        if frontier:
+            state[app_label] = sorted(frontier)
     return state
+
+
+def capture_pending_migrations(included_apps):
+    """Migrations the extracting code knows but the source database has
+    not applied, per included app -- the gap between the models and the
+    data. Informational: the extraction already reads around it.
+    """
+    loader = MigrationLoader(connection, ignore_no_migrations=True)
+    pending = {}
+    for app_name, name in loader.graph.nodes:
+        if app_name in included_apps and (app_name, name) not in loader.applied_migrations:
+            pending.setdefault(app_name, []).append(name)
+    return {app_label: sorted(names) for app_label, names in pending.items()}
 
 
 def check_migration_compatibility(manifest):
@@ -242,7 +329,8 @@ def check_migration_compatibility(manifest):
     return unknown
 
 
-def build_manifest(scope, included_apps, counts, source_engine=None, migrations=None):
+def build_manifest(scope, included_apps, counts, source_engine=None, migrations=None,
+                   pending_migrations=None, schema_gaps=None):
     return {
         "format_version": BUNDLE_FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -252,71 +340,143 @@ def build_manifest(scope, included_apps, counts, source_engine=None, migrations=
         "excluded_apps": sorted(DEFAULT_EXCLUDED_APPS),
         "counts": counts,
         "migrations": migrations or {},
+        "pending_migrations": pending_migrations or {},
+        "schema_gaps": schema_gaps or {"missing_tables": [], "missing_fields": {}},
     }
 
 
-def _dumpdata_app_to_file(app_label, out_path, exclude=None):
-    # natural_primary=True would omit 'pk' for models that define a
-    # natural_key() (Django's own user model, among others), which the
-    # per-(model, pk) conflict check below depends on. natural_foreign
-    # stays on so FKs into apps excluded from the package (contenttypes)
-    # still resolve.
+class _SchemaGaps:
+    """What the models declare but the source database lacks, collected
+    while dumping and recorded in the manifest."""
+
+    def __init__(self):
+        self.missing_tables = set()
+        self.missing_fields = {}
+
+    def plan(self, model, schema):
+        plan = dumpable_fields(model, schema)
+        if plan is None:
+            self.missing_tables.add(model._meta.label)
+        elif plan[1]:
+            self.missing_fields[model._meta.label] = sorted(plan[1])
+        return plan
+
+    def as_dict(self):
+        return {
+            "missing_tables": sorted(self.missing_tables),
+            "missing_fields": dict(sorted(self.missing_fields.items())),
+        }
+
+
+def _write_querysets(out_path, querysets, schema, gaps):
+    """Serialize `querysets`, in order, into one JSON array at out_path --
+    the same format `dumpdata` writes and `loaddata` reads. Each queryset
+    selects only the columns the source database has (see
+    dumpable_fields), so a database behind the code is read as it is
+    instead of failing on the first column or table it does not have yet.
+
+    natural_primary_keys stays off: it would omit 'pk' for models that
+    define a natural_key() (Django's own user model, among others), which
+    the per-(model, pk) conflict check on import depends on. Natural
+    foreign keys stay on so FKs into apps excluded from the package
+    (contenttypes) still resolve.
+    """
+    first = True
     with out_path.open('w', encoding='utf-8') as fh:
-        call_command(
-            'dumpdata', app_label,
-            natural_foreign=True, natural_primary=False,
-            indent=2, format='json',
-            exclude=exclude or [],
-            stdout=fh,
-        )
+        fh.write('[')
+        for queryset in querysets:
+            plan = gaps.plan(queryset.model, schema)
+            if plan is None:
+                continue
+            fields, _missing = plan
+            m2m_names = {f.name for f in queryset.model._meta.local_many_to_many}
+            # The pk is named explicitly: only() with no names at all
+            # would select every column again.
+            pk_name = queryset.model._meta.pk.name
+            concrete = [name for name in fields if name not in m2m_names]
+            queryset = queryset.only(pk_name, *concrete).order_by(pk_name)
+            chunk = serializers.serialize(
+                'json', queryset.iterator(), fields=fields,
+                use_natural_foreign_keys=True, use_natural_primary_keys=False,
+                indent=2,
+            )
+            body = chunk.strip()[1:-1].strip()
+            if not body:
+                continue
+            fh.write('\n' if first else ',\n')
+            fh.write(body)
+            first = False
+        fh.write('\n]\n')
 
 
-def _model_counts_for_app(app_label, excluded_models):
-    counts = {}
-    for model in apps.get_app_config(app_label).get_models():
-        model_key = f'{app_label}.{model.__name__}'
-        if model_key.lower() in excluded_models:
+def _app_querysets(app_label, excluded_models):
+    """Default-manager querysets for every model `dumpdata` would dump from
+    app_label, in its dependency order (natural keys need referenced rows
+    first)."""
+    app_config = apps.get_app_config(app_label)
+    querysets = []
+    for model in serializers.sort_dependencies([(app_config, None)], allow_cycles=True):
+        if model._meta.label_lower in excluded_models:
             continue
-        counts[model_key] = model._default_manager.count()
+        if model._meta.proxy or not router.allow_migrate_model(connection.alias, model):
+            continue
+        querysets.append(model._default_manager.all())
+    return querysets
+
+
+def _model_counts(querysets, schema):
+    counts = {}
+    for queryset in querysets:
+        if dumpable_fields(queryset.model, schema) is None:
+            continue
+        counts[queryset.model._meta.label] = queryset.count()
     return counts
 
 
 def dump_apps_to_bundle(work_dir, department=None):
-    """Write manifest.json + data/<app>.json into work_dir. Returns the manifest."""
+    """Write manifest.json + data/<app>.json into work_dir. Returns the manifest.
+
+    Reads the source database as it is: models whose table it does not
+    have are skipped, fields whose column it does not have are left out,
+    and both are listed under manifest["schema_gaps"]. The migrations the
+    data was read at go in manifest["migrations"].
+    """
     work_dir = Path(work_dir)
     data_dir = work_dir / 'data'
     data_dir.mkdir(parents=True, exist_ok=True)
 
     included_apps = resolve_included_apps(department)
+    schema = SourceSchema()
+    gaps = _SchemaGaps()
     counts = {}
 
     if department is None:
         for app_label in included_apps:
-            exclude = [m for m in DEFAULT_EXCLUDED_MODELS if m.startswith(f'{app_label}.')]
-            _dumpdata_app_to_file(app_label, data_dir / f'{app_label}.json', exclude=exclude)
-            counts.update(_model_counts_for_app(app_label, DEFAULT_EXCLUDED_MODELS))
+            querysets = _app_querysets(app_label, DEFAULT_EXCLUDED_MODELS)
+            _write_querysets(data_dir / f'{app_label}.json', querysets, schema, gaps)
+            counts.update(_model_counts(querysets, schema))
         scope = {"type": "full"}
     else:
         shared_app = _shared_app_label()
-        querysets = resolve_department_closure(department)
         if shared_app:
-            shared_path = data_dir / f'{shared_app}.json'
-            with shared_path.open('w', encoding='utf-8') as fh:
-                serializers.serialize(
-                    'json', chain(*querysets),
-                    use_natural_foreign_keys=True, use_natural_primary_keys=False,
-                    indent=2, stream=fh,
-                )
-            for qs in querysets:
-                counts[f'{shared_app}.{qs.model.__name__}'] = qs.count()
+            querysets = resolve_department_closure(department, schema=schema)
+            _write_querysets(data_dir / f'{shared_app}.json', querysets, schema, gaps)
+            for queryset in querysets:
+                if dumpable_fields(queryset.model, schema) is not None:
+                    counts[f'{shared_app}.{queryset.model.__name__}'] = queryset.count()
 
-        _dumpdata_app_to_file(department, data_dir / f'{department}.json')
-        counts.update(_model_counts_for_app(department, DEFAULT_EXCLUDED_MODELS))
+        querysets = _app_querysets(department, DEFAULT_EXCLUDED_MODELS)
+        _write_querysets(data_dir / f'{department}.json', querysets, schema, gaps)
+        counts.update(_model_counts(querysets, schema))
 
         scope = {"type": "department", "department": department}
 
-    migrations = capture_migration_state(included_apps)
-    manifest = build_manifest(scope, included_apps, counts, migrations=migrations)
+    manifest = build_manifest(
+        scope, included_apps, counts,
+        migrations=capture_migration_state(included_apps),
+        pending_migrations=capture_pending_migrations(included_apps),
+        schema_gaps=gaps.as_dict(),
+    )
     (work_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return manifest
 

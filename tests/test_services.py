@@ -19,6 +19,9 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+from django.db import connection
+from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.recorder import MigrationRecorder
 from django.test import override_settings
 
 from db_portability import services as svc
@@ -300,6 +303,89 @@ class DumpAppsToBundleTests(PortabilityTestCase):
         with self.assertRaises(ValueError):
             svc.dump_apps_to_bundle(work_dir, department='marketing')
         self.assertEqual(list((work_dir / 'data').glob('*.json')), [])
+
+
+def _drop_table(model):
+    with connection.cursor() as cursor:
+        cursor.execute(f'DROP TABLE {connection.ops.quote_name(model._meta.db_table)}')
+
+
+def _drop_column(model, field_name):
+    table = connection.ops.quote_name(model._meta.db_table)
+    column = connection.ops.quote_name(model._meta.get_field(field_name).column)
+    with connection.cursor() as cursor:
+        cursor.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+
+
+class SourceBehindCodeTests(PortabilityTestCase):
+    """The extracting code may be ahead of the source database (its
+    migrations not applied there yet). The extraction reads the database
+    as it is instead of failing on what the models declare but the
+    database does not have, and records the gap in the manifest. The DDL
+    below runs inside the test transaction and is rolled back with it.
+    """
+
+    def setUp(self):
+        self.sales_person = SalesPerson.objects.create(name='Dana')
+        Account.objects.create(person=self.sales_person, username='dana')
+        BrandingConfig.objects.create(department='sales', headline='Sales HQ')
+        Announcement.objects.create(title='Hello')
+
+    def _entries(self, work_dir, app_label, model_label):
+        entries = json.loads((work_dir / 'data' / f'{app_label}.json').read_text())
+        return [e for e in entries if e['model'] == model_label]
+
+    def test_model_without_a_table_is_skipped_and_recorded(self):
+        _drop_table(Announcement)
+        work_dir = _tempdir(self)
+        manifest = svc.dump_apps_to_bundle(work_dir)
+        self.assertEqual(self._entries(work_dir, 'people', 'people.announcement'), [])
+        self.assertNotIn('people.Announcement', manifest['counts'])
+        self.assertIn('people.Announcement', manifest['schema_gaps']['missing_tables'])
+        self.assertEqual(manifest['counts']['people.Person'], 1)
+
+    def test_field_without_a_column_is_left_out_and_recorded(self):
+        _drop_column(BrandingConfig, 'headline')
+        work_dir = _tempdir(self)
+        manifest = svc.dump_apps_to_bundle(work_dir)
+        [entry] = self._entries(work_dir, 'people', 'people.brandingconfig')
+        self.assertEqual(entry['fields'], {'department': 'sales'})
+        self.assertEqual(
+            manifest['schema_gaps']['missing_fields'], {'people.BrandingConfig': ['headline']},
+        )
+
+    def test_mti_child_field_without_a_column_is_left_out(self):
+        _drop_column(SalesPerson, 'quota')
+        work_dir = _tempdir(self)
+        manifest = svc.dump_apps_to_bundle(work_dir, department='sales')
+        [entry] = self._entries(work_dir, 'sales', 'sales.salesperson')
+        self.assertNotIn('quota', entry['fields'])
+        self.assertEqual(manifest['schema_gaps']['missing_fields'], {'sales.SalesPerson': ['quota']})
+
+    def test_department_closure_skips_a_referencing_model_without_a_table(self):
+        _drop_table(Account)
+        work_dir = _tempdir(self)
+        manifest = svc.dump_apps_to_bundle(work_dir, department='sales')
+        self.assertEqual(self._entries(work_dir, 'people', 'people.account'), [])
+        self.assertEqual(len(self._entries(work_dir, 'people', 'people.person')), 1)
+        self.assertNotIn('people.Account', manifest['counts'])
+
+    def test_schema_in_step_with_the_code_records_no_gaps(self):
+        manifest = svc.dump_apps_to_bundle(_tempdir(self))
+        self.assertEqual(manifest['schema_gaps'], {'missing_tables': [], 'missing_fields': {}})
+
+    def test_unapplied_leaf_records_the_applied_predecessor_and_the_pending_one(self):
+        loader = MigrationLoader(connection)
+        [leaf] = [key for key in loader.graph.leaf_nodes() if key[0] == 'auth']
+        [parent] = [key for key in loader.graph.node_map[leaf].parents if key[0] == 'auth']
+        MigrationRecorder(connection).record_unapplied(*leaf)
+
+        self.assertEqual(svc.capture_migration_state(['auth']), {'auth': [parent[1]]})
+        self.assertEqual(svc.capture_pending_migrations(['auth']), {'auth': [leaf[1]]})
+
+    def test_applied_migration_unknown_to_the_code_is_recorded(self):
+        MigrationRecorder(connection).record_applied('auth', '9999_from_the_future')
+        self.assertIn('9999_from_the_future', svc.capture_migration_state(['auth'])['auth'])
 
 
 class BundleArchiveTests(PortabilityTestCase):
